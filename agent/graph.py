@@ -38,7 +38,6 @@ def architect_agent(state: dict) -> dict:
         raise ValueError("Planner did not return a valid response.")
 
     resp.plan = plan
-    print(resp.model_dump_json())
     return {"task_plan": resp}
 
 

@@ -1,13 +1,12 @@
+import re
 import sys
 import threading
 import queue
 import traceback
-from io import StringIO
 from pathlib import Path
 
-import streamlit.components.v1 as components
-
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,57 +17,30 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🤖 Coder Buddy")
-st.caption("Describe your project and let the AI plan, architect, and code it for you.")
-
-# ── sidebar ──────────────────────────────────────────────────────────────────
+# ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.title("🤖 Coder Buddy")
+    st.caption("AI-powered project generator")
+    st.divider()
     st.header("Settings")
     recursion_limit = st.slider("Recursion limit", 10, 300, 100, step=10)
     st.divider()
-    st.markdown("**Generated files** will appear in `./generated_project/`")
-    if st.button("Open generated_project folder"):
-        import subprocess, os
+    st.markdown("**Generated files** appear in `./generated_project/`")
+    if st.button("Open output folder"):
+        import subprocess
         folder = Path.cwd() / "generated_project"
         folder.mkdir(exist_ok=True)
         subprocess.Popen(f'explorer "{folder}"')
 
-# ── main input ────────────────────────────────────────────────────────────────
-user_prompt = st.text_area(
-    "What would you like to build?",
-    placeholder="e.g. Build a colourful modern todo app in HTML, CSS, and JS",
-    height=120,
-)
-
-run_btn = st.button("Generate Project", type="primary", disabled=not user_prompt.strip())
+# ── session state ─────────────────────────────────────────────────────────────
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "running" not in st.session_state:
+    st.session_state.running = False
+if "result" not in st.session_state:
+    st.session_state.result = None
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-def run_agent_in_thread(prompt: str, limit: int, log_queue: queue.Queue):
-    """Runs the langgraph agent in a background thread, streaming stdout to log_queue."""
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-
-    class QueueWriter(StringIO):
-        def write(self, text):
-            if text.strip():
-                log_queue.put(("log", text))
-
-    sys.stdout = QueueWriter()
-    sys.stderr = QueueWriter()
-    try:
-        from agent.graph import agent
-        result = agent.invoke(
-            {"user_prompt": prompt},
-            {"recursion_limit": limit},
-        )
-        log_queue.put(("done", result))
-    except Exception:
-        log_queue.put(("error", traceback.format_exc()))
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-
 
 def list_generated_files() -> list[str]:
     root = Path.cwd() / "generated_project"
@@ -82,171 +54,235 @@ REACT_INDICATORS = {"jsx", "tsx", "react", "vite", "next"}
 
 
 def is_react_project(files: list[str]) -> bool:
-    all_text = " ".join(files).lower()
-    return any(ind in all_text for ind in REACT_INDICATORS)
+    text = " ".join(files).lower()
+    return any(ind in text for ind in REACT_INDICATORS)
 
 
-def build_react_preview(root: Path) -> str | None:
-    """Inline all JS/CSS into the index.html so we can render it without a server."""
-    index = root / "index.html"
-    if not index.exists():
-        return None
-
-    html = index.read_text(encoding="utf-8", errors="replace")
-
-    # Replace <script src="..."> with inline <script>
-    import re
-    def inline_script(m):
+def inline_assets(html: str, base_dir: Path) -> str:
+    def _script(m):
         src = m.group(1)
-        js_path = root / src.lstrip("/")
-        if js_path.exists():
-            code = js_path.read_text(encoding="utf-8", errors="replace")
-            return f"<script>{code}</script>"
+        p = base_dir / src
+        if p.exists():
+            return f"<script>{p.read_text(encoding='utf-8', errors='replace')}</script>"
         return m.group(0)
 
-    def inline_style(m):
+    def _style(m):
         href = m.group(1)
-        css_path = root / href.lstrip("/")
-        if css_path.exists():
-            code = css_path.read_text(encoding="utf-8", errors="replace")
-            return f"<style>{code}</style>"
+        p = base_dir / href
+        if p.exists():
+            return f"<style>{p.read_text(encoding='utf-8', errors='replace')}</style>"
         return m.group(0)
 
-    html = re.sub(r'<script[^>]+src=["\']([^"\']+)["\'][^>]*></script>', inline_script, html)
-    html = re.sub(r'<link[^>]+rel=["\']stylesheet["\'][^>]+href=["\']([^"\']+)["\'][^>]*/?>',
-                  inline_style, html)
+    html = re.sub(r'<script[^>]+src=["\']([^"\']+)["\'][^>]*></script>', _script, html)
+    html = re.sub(
+        r'<link[^>]+rel=["\']stylesheet["\'][^>]+href=["\']([^"\']+)["\'][^>]*/?>',
+        _style, html,
+    )
     return html
 
 
-# ── run ───────────────────────────────────────────────────────────────────────
-if run_btn:
-    st.divider()
-    col_log, col_files = st.columns([3, 2])
+NODE_MESSAGES = {
+    "planner":  ("🧠", "Planning your project…",       "Got it! I've analysed your request and built a plan."),
+    "architect": ("📐", "Designing the architecture…", "Architecture ready — breaking the work into tasks."),
+    "coder":    ("💻", "Writing code…",                 None),  # dynamic per file
+}
 
-    with col_log:
-        st.subheader("Live log")
-        log_box = st.empty()
-        status_box = st.empty()
 
-    with col_files:
-        st.subheader("Generated files")
-        files_box = st.empty()
+def run_agent_in_thread(prompt: str, limit: int, q: queue.Queue):
+    """Streams langgraph node events into q as (kind, payload) tuples."""
+    # Suppress all stdout/stderr noise from langchain
+    import os, io
+    devnull = open(os.devnull, "w", encoding="utf-8")
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = devnull
+    sys.stderr = devnull
 
-    log_lines: list[str] = []
+    try:
+        from agent.graph import agent
+
+        prev_node = None
+        coder_step = 0
+
+        for event in agent.stream(
+            {"user_prompt": prompt},
+            {"recursion_limit": limit},
+            stream_mode="updates",
+        ):
+            node = next(iter(event))
+            state = event[node]
+
+            if node != prev_node:
+                prev_node = node
+                icon, thinking, done = NODE_MESSAGES.get(node, ("⚙️", f"Running {node}…", None))
+
+                if node == "coder":
+                    task_plan = state.get("task_plan") or (
+                        state.get("coder_state") and state["coder_state"].task_plan
+                    )
+                    steps = task_plan.implementation_steps if task_plan else []
+                    coder_step_idx = (state.get("coder_state") and state["coder_state"].current_step_idx - 1) or coder_step
+                    coder_step += 1
+                    if steps and 0 <= coder_step_idx < len(steps):
+                        filepath = steps[coder_step_idx].filepath
+                        done = f"Wrote `{filepath}`"
+                    else:
+                        done = f"Wrote file #{coder_step}"
+
+                q.put(("thinking", (icon, thinking)))
+
+            # when node output arrives, post the "done" message
+            icon, _, done_msg = NODE_MESSAGES.get(node, ("⚙️", "", None))
+            if node == "coder":
+                cs = state.get("coder_state")
+                if cs:
+                    idx = cs.current_step_idx - 1
+                    steps = cs.task_plan.implementation_steps
+                    if 0 <= idx < len(steps):
+                        done_msg = f"Wrote `{steps[idx].filepath}`"
+                    else:
+                        done_msg = f"Coding step complete."
+
+            if done_msg:
+                q.put(("done_step", (icon, done_msg)))
+
+        # final state comes from last event
+        last_state = state if 'state' in dir() else {}
+        q.put(("finished", last_state))
+
+    except Exception:
+        q.put(("error", traceback.format_exc()))
+    finally:
+        sys.stdout = old_out
+        sys.stderr = old_err
+        devnull.close()
+
+
+# ── chat display ──────────────────────────────────────────────────────────────
+
+def render_messages():
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"], avatar=msg.get("avatar")):
+            st.markdown(msg["content"])
+
+
+render_messages()
+
+# ── input bar ─────────────────────────────────────────────────────────────────
+user_input = st.chat_input(
+    "Describe the project you want to build…",
+    disabled=st.session_state.running,
+)
+
+if user_input and not st.session_state.running:
+    # show user message
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.running = True
+    st.session_state.result = None
+    st.rerun()
+
+# ── agent loop ────────────────────────────────────────────────────────────────
+if st.session_state.running:
+    # the last message in state is the user prompt
+    prompt = next(
+        (m["content"] for m in reversed(st.session_state.messages) if m["role"] == "user"),
+        "",
+    )
+
     q: queue.Queue = queue.Queue()
-
     thread = threading.Thread(
         target=run_agent_in_thread,
-        args=(user_prompt.strip(), recursion_limit, q),
+        args=(prompt, recursion_limit, q),
         daemon=True,
     )
     thread.start()
 
-    status_box.info("Agent is running…")
+    # live "thinking" bubble
+    with st.chat_message("assistant", avatar="🤖"):
+        status_placeholder = st.empty()
+        status_placeholder.markdown("_Thinking…_")
 
     while thread.is_alive() or not q.empty():
         try:
-            kind, payload = q.get(timeout=0.3)
+            kind, payload = q.get(timeout=0.4)
         except queue.Empty:
-            # refresh file list while waiting
-            files = list_generated_files()
-            if files:
-                files_box.markdown("\n".join(f"- `{f}`" for f in files))
             continue
 
-        if kind == "log":
-            log_lines.append(payload.rstrip())
-            log_box.code("\n".join(log_lines[-120:]), language="text")
+        if kind == "thinking":
+            icon, text = payload
+            status_placeholder.markdown(f"{icon} _{text}_")
 
-        elif kind == "done":
-            result = payload
-            status_box.success("Project generated successfully!")
+        elif kind == "done_step":
+            icon, text = payload
+            st.session_state.messages.append({
+                "role": "assistant",
+                "avatar": "🤖",
+                "content": f"{icon} {text}",
+            })
 
-            # show plan summary if available
-            plan = result.get("plan")
-            task_plan = result.get("task_plan")
+        elif kind == "finished":
+            state = payload
+            plan = state.get("plan")
+            task_plan = state.get("task_plan")
+
+            summary_lines = ["**Your project is ready!** Here's what was built:\n"]
             if plan:
-                with st.expander("Plan", expanded=True):
-                    st.markdown(f"**{plan.name}** — {plan.description}")
-                    st.markdown(f"**Tech stack:** {plan.techstack}")
-                    st.markdown("**Features:**")
-                    for feat in plan.features:
-                        st.markdown(f"- {feat}")
-
+                summary_lines.append(f"**{plan.name}** — {plan.description}")
+                summary_lines.append(f"**Tech stack:** `{plan.techstack}`")
+                summary_lines.append("\n**Features:**")
+                for f in plan.features:
+                    summary_lines.append(f"- {f}")
             if task_plan:
-                with st.expander("Implementation steps", expanded=False):
-                    for i, step in enumerate(task_plan.implementation_steps, 1):
-                        st.markdown(f"**{i}. `{step.filepath}`**")
-                        st.markdown(step.task_description)
+                summary_lines.append(f"\n**{len(task_plan.implementation_steps)} files generated.**")
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "avatar": "🤖",
+                "content": "\n".join(summary_lines),
+            })
+            st.session_state.result = state
+            st.session_state.running = False
+            break
 
         elif kind == "error":
-            status_box.error("An error occurred.")
-            st.code(payload, language="text")
+            st.session_state.messages.append({
+                "role": "assistant",
+                "avatar": "🤖",
+                "content": f"❌ Something went wrong:\n```\n{payload}\n```",
+            })
+            st.session_state.running = False
+            break
 
-    # final file list
-    files = list_generated_files()
+    st.rerun()
+
+# ── results (preview + file viewer) ──────────────────────────────────────────
+if st.session_state.result is not None and not st.session_state.running:
     root = Path.cwd() / "generated_project"
+    files = list_generated_files()
+
     if files:
-        files_box.markdown("\n".join(f"- `{f}`" for f in files))
-
-        # ── preview section ──────────────────────────────────────────────────
+        st.divider()
         html_files = [f for f in files if Path(f).suffix.lower() in PREVIEW_EXTENSIONS]
-        if html_files or is_react_project(files):
-            st.divider()
+        react = is_react_project(files)
+
+        if html_files or react:
             st.subheader("Preview")
-
-            if is_react_project(files):
-                inlined = build_react_preview(root)
-                if inlined:
-                    components.html(inlined, height=600, scrolling=True)
+            if react:
+                index = root / "index.html"
+                if index.exists():
+                    html = inline_assets(index.read_text(encoding="utf-8", errors="replace"), root)
+                    components.html(html, height=620, scrolling=True)
                 else:
-                    st.info(
-                        "React project detected. Run `npm install && npm run build` "
-                        "inside `generated_project/`, then reopen the app to see the preview."
-                    )
-            elif html_files:
-                preview_file = st.selectbox(
-                    "Choose HTML file to preview",
-                    html_files,
-                    key="preview_select",
-                )
-                if preview_file:
-                    html_content = (root / preview_file).read_text(
-                        encoding="utf-8", errors="replace"
-                    )
+                    st.info("React project detected — run `npm install && npm run build` inside `generated_project/` to see the preview.")
+            else:
+                pick = st.selectbox("HTML file to preview", html_files, key="preview_pick")
+                if pick:
+                    raw = (root / pick).read_text(encoding="utf-8", errors="replace")
+                    html = inline_assets(raw, (root / pick).parent)
+                    components.html(html, height=620, scrolling=True)
 
-                    # Inline linked CSS/JS relative to the HTML file
-                    import re
-                    html_dir = (root / preview_file).parent
-
-                    def _inline_script(m):
-                        src = m.group(1)
-                        p = html_dir / src
-                        if p.exists():
-                            return f"<script>{p.read_text(encoding='utf-8', errors='replace')}</script>"
-                        return m.group(0)
-
-                    def _inline_style(m):
-                        href = m.group(1)
-                        p = html_dir / href
-                        if p.exists():
-                            return f"<style>{p.read_text(encoding='utf-8', errors='replace')}</style>"
-                        return m.group(0)
-
-                    html_content = re.sub(
-                        r'<script[^>]+src=["\']([^"\']+)["\'][^>]*></script>',
-                        _inline_script, html_content,
-                    )
-                    html_content = re.sub(
-                        r'<link[^>]+rel=["\']stylesheet["\'][^>]+href=["\']([^"\']+)["\'][^>]*/?>',
-                        _inline_style, html_content,
-                    )
-                    components.html(html_content, height=600, scrolling=True)
-
-        # ── file viewer ──────────────────────────────────────────────────────
         st.divider()
         st.subheader("View source")
-        chosen = st.selectbox("Pick a file", files)
+        chosen = st.selectbox("File", files, key="src_pick")
         if chosen:
             content = (root / chosen).read_text(encoding="utf-8", errors="replace")
             ext = Path(chosen).suffix.lstrip(".")
