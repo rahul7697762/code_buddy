@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Landing Page</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <script defer src="js/script.js"></script>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <img src="assets/logo.png" alt="Logo" class="logo">
+        <ul class="nav-links">
+            <li><a href="#hero" data-scroll>Home</a></li>
+            <li><a href="#features" data-scroll>Features</a></li>
+            <li><a href="#contact" data-scroll>Contact</a></li>
+        </ul>
+    </nav>
+
+    <!-- Hero Section -->
+    <section id="hero" class="hero">
+        <div class="hero-content">
+            <h1>Welcome to Our Product</h1>
+            <p>Your solution for modern web experiences.</p>
+            <button class="cta-btn">Get Started</button>
+        </div>
+        <div class="hero-bg"></div>
+    </section>
+
+    <!-- Features Section -->
+    <section id="features" class="features">
+        <div class="features-grid">
+            <article class="feature-card">
+                <img src="assets/feature1.png" alt="Feature 1 Icon">
+                <h3>Feature One</h3>
+                <p>Brief description of the first feature highlighting its benefits.</p>
+            </article>
+            <article class="feature-card">
+                <img src="assets/feature2.png" alt="Feature 2 Icon">
+                <h3>Feature Two</h3>
+                <p>Brief description of the second feature highlighting its benefits.</p>
+            </article>
+            <article class="feature-card">
+                <img src="assets/feature3.png" alt="Feature 3 Icon">
+                <h3>Feature Three</h3>
+                <p>Brief description of the third feature highlighting its benefits.</p>
+            </article>
+        </div>
+    </section>
+
+    <!-- Contact Section -->
+    <section id="contact" class="contact">
+        <form id="contactForm" novalidate>
+            <div class="form-group">
+                <label for="name">Name</label>
+                <input type="text" id="name" name="name" required>
+            </div>
+            <div class="form-group">
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email" required>
+            </div>
+            <div class="form-group">
+                <label for="message">Message</label>
+                <textarea id="message" name="message" rows="5" required></textarea>
+            </div>
+            <button type="submit">Send Message</button>
+        </form>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <p>&copy; 2024 Your Company. All rights reserved.</p>
+    </footer>
+</body>
+</html>
